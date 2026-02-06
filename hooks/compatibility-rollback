@@ -1,0 +1,545 @@
+#!/usr/bin/ash
+
+# --*--Do Not Modify The Variables Below Unless You Know What You Are Doing!--*--
+
+mountOpts='noatime,fix_errors'
+new_root=/new_root
+user=user
+mnt=/mnt
+squashfs_dir='/.squashfs/'         # Default squashfs directory
+squashfs_dir_no_slash='/.squashfs' # Ensure that rsync does not have path errors
+efiPartNum='1'                     # What partition is efi on? (leave blank to not mount)
+bootPartNum='2'                    # What partition is boot on? (leave blank to not mount)
+
+# Useful file: /usr/lib/initcpio/init
+
+overlayFlag=false
+tmpfsFlag=false
+squashfsFlag=false
+
+# --*-------------------------------------------------------------------------*--
+# Function to display message and wait for Enter key
+press_enter_to_continue() {
+	echo -e "\nPress [enter] to continue or go back to menu"
+	read -n 1
+}
+
+# Function to list available files in the squashfs directory
+list_squashfs() {
+	if [ -d "$mnt$squashfs_dir" ]; then
+		# List all files in the directory (not only .squashfs)
+		local squashFiles=$(ls -1 "$mnt$squashfs_dir" 2>/dev/null)
+		if [ -z "$squashFiles" ]; then
+			echo "There's no file in $squashfs_dir directory. Press [enter] to return."
+			read -n 1
+			return 1
+		else
+			echo "$squashFiles"
+			return 0
+		fi
+	else
+		echo "Directory $squashfs_dir does not exist. Press [enter] to return."
+		read -n 1
+		return 1
+	fi
+}
+
+boot() {
+
+	# Check if the boot directory contains a bootable system (assume working system has /etc)
+	if [ -d "$mnt$1/etc" ]; then
+
+		echo -e "Booting $1...\n"
+
+		if [ $tmpfsFlag = 'true' ]; then
+			echo create_tmpfs "$1"
+			create_tmpfs "$1"
+		else
+			mount --bind -o "$mountOpts" "$mnt$1" ${new_root}
+		fi
+
+		[ $overlayFlag = 'true' ] && create_overlay
+
+		finished=true
+
+	else
+
+		error "No system found at $1."
+		showMenu=true
+	fi
+
+}
+
+create_overlay() {
+
+	echo -e "Booting in overlay mode...\n"
+
+	local lower_dir=$(mktemp -d -p /)
+	local ram_dir=$(mktemp -d -p /)
+	mount --move ${new_root} ${lower_dir}
+	mount -t tmpfs cowspace ${ram_dir}
+	mkdir -p ${ram_dir}/upper ${ram_dir}/work
+	mount -t overlay -o lowerdir=${lower_dir},upperdir=${ram_dir}/upper,workdir=${ram_dir}/work rootfs ${new_root}
+
+}
+
+create_tmpfs() {
+
+	mount -t tmpfs -o size=80% none $new_root
+
+	echo -e "\nCopying root filesystem to RAM. Please be patient...\n"
+
+	rsync --info=progress2 -axHAXSW --exclude=/efi/ --exclude=/boot/ --exclude=/home/user/.cache/ --exclude=setup.tar.gz --exclude /home/user/.local/share/Trash/ --exclude=/dev/ --exclude=/var/cache/pacman/ --exclude=/run/timeshift/ --exclude=/proc/ --exclude=/sys/ --exclude=/tmp/ --exclude=/run/ --exclude=/mnt/ --exclude=$squashfs_dir_no_slash/* --exclude=/var/tmp/ --exclude=/var/log/ --exclude=/var/lib/systemd/random-seed --exclude=/root/.cache/* "$mnt$1/" ${new_root}
+
+}
+
+error() {
+
+	echo -e "\n<<< $1 >>>\n"
+	press_enter_to_continue
+
+}
+
+run_latehook() {
+
+	# Automatically find the proper root partition which was booted
+	root_part=$(mount | grep ${new_root} | sed "s# on ${new_root}.*##")
+	disk=$(mount | grep ${new_root} | sed "s#[0-9] on ${new_root}.*##")
+
+	# System pre-mounted, but we want to mount the systems differently
+	umount ${new_root}
+
+	mkdir -p $mnt
+
+	finished=false
+	showMenu=false
+
+	echo bcachefs mount -o "$mountOpts" ${root_part} ${mnt}
+	bcachefs mount -o "$mountOpts" ${root_part} ${mnt}
+
+	# Check if the squashfs folder exists. If not, create it.
+	if [ ! -d "$mnt/.squashfs" ]; then
+		mkdir -p "$mnt/.squashfs"
+	fi
+
+	echo -e "\nPress any key for menu.\n"
+	if [ $(read -sn1 -t 2 && echo 1) ]; then
+		showMenu=true
+	else
+		# Timeout - boot into / automatically
+		boot /
+	fi
+
+	while [ ! "$finished" = 'true' ]; do
+
+		if [ $showMenu = 'true' ]; then
+
+			echo -e "\n\nWhat would you like to do?
+
+-*-START-LIST-OPTIONS-*-
+
+---Boot Options---
+<b> boot root system (/)
+<x> boot into squashfs (/.squashfs/name-squashfs-file)
+<c> boot custom dir
+
+---Restore Options---
+<u> restore using rsync
+<Y> restore squashfs to root (/)
+
+---Create Options---
+<z> create squashfs
+
+---Delete Options---
+<d> delete root system (/) - WARNING: destructive!
+<k> delete squashfs
+
+---Edit Options---
+<v> rename squashfs
+
+---Other Options---
+<o> add overlay flag
+<t> add tmpfs flag
+<m> add custom mount opts (Not working)
+
+-*-END-LIST-OPTIONS-*-
+<e> enter bash
+<f> fsck
+<q> quit
+
+<ENTER> boot /\n\n"
+
+			read -sn 1 key
+
+		fi
+
+		if [[ "$key" = 'u' ]]; then
+
+			echo -e "\nEnter a source.
+(eg., '/', '/custom-dir')\n"
+
+			read Source
+
+			echo -e "\nEnter a target.
+(eg., '/', '/custom-dir')\n"
+
+			read Target
+
+			mkdir -p "$mnt$Target"
+
+			rsync_params="-axHAXSW --del --exclude=/lost+found/ --exclude=/dev/ --exclude=/proc/ --exclude=/sys/ --exclude=/tmp/ --exclude=/run/ --exclude=/var/tmp/ --exclude=/var/lib/dhcpcd/ --exclude=/var/log/ --exclude=/var/lib/systemd/random-seed --exclude=/root/.cache/ --exclude=/boot/ --exclude=/efi/ --exclude=/media/ --exclude=/mnt/ --exclude=/home/$user/.cache/ --exclude=/home/$user/.local/share/Trash/ --exclude=$mnt/ --exclude=$squashfs_dir_no_slash/"
+
+			rsync --dry-run -v $rsync_params "$mnt$Source" "$mnt$Target" | less
+
+			read -p "Type 'y' to proceed with rsync or any other key to exit..." choice
+
+			if [[ $choice = 'y' ]]; then
+
+				rsync --info=progress2 $rsync_params "$mnt$Source" "$mnt$Target"
+
+				echo "Sync finished."
+				press_enter_to_continue
+
+			else
+				echo "Exiting."
+				press_enter_to_continue
+			fi
+
+		elif [[ "$key" = 'f' ]]; then
+
+			echo 'To save logs run: bcachefs fsck -p > $mnt/log_file.txt 2>&1'
+			echo bcachefs fsck -p ${root_part}
+			bcachefs fsck -p ${root_part}
+			press_enter_to_continue
+
+		elif [[ "$key" = 'z' ]]; then
+
+			echo -e "\nEnter a source path to create from (or 'b' to go back).
+(eg., '/')\n"
+
+			read squashSource
+
+			# Check if user wants to go back
+			if [[ "$squashSource" == "b" ]]; then
+				echo "Going back to menu..."
+				continue
+			fi
+
+			echo -e "\nEnter a name for the squashfs file (without path, or 'b' to go back):\n"
+			read customSquashFile
+
+			if [[ -e "$squashfs_dir$customSquashFile" ]]; then
+				echo "$customSquashFile already exists in $squashfs_dir folder."
+				continue
+			fi
+
+			# Check if user wants to go back
+			if [[ "$customSquashFile" == "b" ]]; then
+				echo "Going back to menu..."
+				continue
+			fi
+
+			# Add .squashfs extension if not present
+			if [[ "$customSquashFile" != *.squashfs ]]; then
+				customSquashFile="$customSquashFile.squashfs"
+			fi
+
+			[ $efiPartNum ] && mount --mkdir $disk$efiPartNum $mnt/efi
+			[ $bootPartNum ] && mount --mkdir $disk$bootPartNum $mnt/boot
+
+			rsync_params="-axHAXSW --exclude=/lost+found/ --exclude=/dev/ --exclude=/proc/ --exclude=/sys/ --exclude=/tmp/ --exclude=/run/ --exclude=/var/tmp/ --exclude=/var/lib/dhcpcd/ --exclude=/var/log/ --exclude=/var/lib/systemd/random-seed --exclude=/root/.cache/ --exclude=/boot/ --exclude=/efi/ --exclude=/media/ --exclude=/mnt/ --exclude=/home/$user/.cache/ --exclude=/home/$user/.local/share/Trash/ --exclude=$squashfs_dir_no_slash/ --exclude=/var/cache/pacman/pkg/"
+
+			temp_dir=$(mktemp -d)
+
+			echo -e "\nCopying source to temporary directory with rsync...\n"
+			rsync --info=progress2 $rsync_params "$mnt$squashSource/" "$temp_dir/"
+
+			if [ $? -eq 0 ]; then
+
+				echo -e "\nCreating squashfs image...\n"
+				mksquashfs "$temp_dir" "$mnt$squashfs_dir$customSquashFile" -comp zstd -Xcompression-level 9 -b 256K -no-recovery
+
+				if [ $? -eq 0 ]; then
+					echo -e "\nSquashfs image created successfully at $squashfs_dir$customSquashFile"
+					rm -rf "$temp_dir"
+				else
+					error "Failed to create squashfs image."
+					rm -rf "$temp_dir"
+				fi
+			else
+				error "Rsync failed. Squashfs not created."
+				rm -rf "$temp_dir"
+			fi
+
+			[ $efiPartNum ] && umount $mnt/efi
+			[ $bootPartNum ] && umount $mnt/boot
+
+			press_enter_to_continue
+
+		elif [[ "$key" = 'k' ]]; then
+			echo -e "\nAvailable files in $squashfs_dir:\n"
+			if list_squashfs; then
+				while true; do
+					echo -e "\nEnter the name of the file you want to delete (exactly as listed above):"
+					read squashFile
+
+					if [ -z "$squashFile" ]; then
+						error "File name cannot be empty."
+						continue
+					fi
+
+					full_path="$mnt$squashfs_dir$squashFile"
+
+					if [ -f "$full_path" ]; then
+						echo "Are you sure you want to delete $squashFile? (y/n)"
+						read confirm
+						if [[ $confirm = 'y' ]]; then
+							rm "$full_path"
+							echo "File $squashFile deleted."
+							press_enter_to_continue
+						else
+							echo "Cancelled."
+							press_enter_to_continue
+						fi
+						break
+					else
+						error "File not found: $squashFile"
+						echo "Please try again."
+						continue
+					fi
+				done
+			else
+				# Function already displayed error message and waited for enter
+				continue
+			fi
+
+		elif [[ "$key" = 'x' ]]; then
+
+			echo -e "\nAvailable files in $squashfs_dir:\n"
+			if ! list_squashfs; then
+				continue
+			fi
+
+			echo -e "\nType the name of the file you would like to load.\n"
+
+			read squashFile
+
+			squashfsFlag=true
+
+			squashFilePath="$squashfs_dir$squashFile"
+
+			if [ -f "$mnt$squashFilePath" ]; then
+
+				echo -e "\nMounting squashfs file...\n"
+				mkdir -p /squashfs
+				mount -o loop "$mnt$squashFilePath" /squashfs
+
+				if [ $? -eq 0 ]; then
+					echo -e "Squashfs mounted successfully.\n"
+
+					if [ $tmpfsFlag = 'true' ]; then
+						create_tmpfs "/squashfs"
+					else
+						mount --bind -o "$mountOpts" /squashfs ${new_root}
+					fi
+
+					[ $overlayFlag = 'true' ] && create_overlay
+
+					finished=true
+				else
+					error "Failed to mount squashfs."
+				fi
+
+			else
+
+				error "Squashfs file '$squashFile' not found in $squashfs_dir."
+
+			fi
+
+		elif [[ "$key" = 'Y' ]]; then
+
+			echo -e "\nAvailable files in $squashfs_dir:\n"
+			if ! list_squashfs; then
+				continue
+			fi
+
+			echo -e "\nType the name of the squashfs file to restore to root (/).\n"
+			read squashFile
+
+			squashFilePath="$squashfs_dir$squashFile"
+
+			if [ ! -f "$mnt$squashFilePath" ]; then
+				error "Squashfs file '$squashFile' not found in $squashfs_dir."
+				continue
+			fi
+
+			echo -e "\nMounting squashfs file...\n"
+			mkdir -p /squashfs
+			mount -o loop "$mnt$squashFilePath" /squashfs
+
+			if [ $? -ne 0 ]; then
+				error "Failed to mount squashfs."
+				continue
+			fi
+
+			[ $efiPartNum ] && mount --mkdir $disk$efiPartNum $mnt/efi
+			[ $bootPartNum ] && mount --mkdir $disk$bootPartNum $mnt/boot
+
+			rsync_params="-axHAXSW --del --exclude=/lost+found/ --exclude=/dev/ --exclude=/proc/ --exclude=/sys/ --exclude=/tmp/ --exclude=/run/ --exclude=/var/tmp/ --exclude=/var/lib/dhcpcd/ --exclude=/var/log/ --exclude=/var/lib/systemd/random-seed --exclude=/root/.cache/ --exclude=/boot/ --exclude=/efi/ --exclude=/media/ --exclude=/mnt/ --exclude=/home/$user/.cache/ --exclude=/home/$user/.local/share/Trash/ --exclude=$squashfs_dir_no_slash/"
+
+			rsync --dry-run -v $rsync_params /squashfs/ "$mnt/" | less
+
+			read -p "Type 'y' to proceed with rsync or any other key to exit..." choice
+
+			if [[ $choice = 'y' ]]; then
+				rsync --info=progress2 $rsync_params /squashfs/ "$mnt/"
+				echo "Restore finished."
+			else
+				echo "Cancelled."
+			fi
+
+			umount /squashfs
+			[ $efiPartNum ] && umount $mnt/efi
+			[ $bootPartNum ] && umount $mnt/boot
+
+			press_enter_to_continue
+
+		elif [[ "$key" = 'v' ]]; then
+			echo -e "\nAvailable files in $squashfs_dir:\n"
+			if list_squashfs; then
+				while true; do
+					echo -e "\nEnter the current name of the file (exactly as listed above):"
+					read old_squash_name
+
+					if [ -z "$old_squash_name" ]; then
+						error "File name cannot be empty."
+						continue
+					fi
+
+					old_full_path="$mnt$squashfs_dir$old_squash_name"
+
+					if [ -f "$old_full_path" ]; then
+						echo -e "\nEnter the new name for the file (exactly as you want it):"
+						read new_squash_name
+
+						if [ -z "$new_squash_name" ]; then
+							error "New name cannot be empty."
+							continue
+						fi
+
+						new_full_path="$mnt$squashfs_dir$new_squash_name"
+
+						if [ -f "$new_full_path" ]; then
+							error "A file with name '$new_squash_name' already exists."
+						else
+							echo "Rename $old_squash_name to $new_squash_name? (y/n)"
+							read confirm
+							if [[ $confirm = 'y' ]]; then
+								mv "$old_full_path" "$new_full_path"
+								echo "File renamed."
+								press_enter_to_continue
+							else
+								echo "Cancelled."
+								press_enter_to_continue
+							fi
+						fi
+						break
+					else
+						error "File not found: $old_squash_name"
+						echo "Please try again."
+						continue
+					fi
+				done
+			else
+				# Function already displayed error message and waited for enter
+				continue
+			fi
+
+		elif [[ "$key" = 'o' ]]; then
+
+			[ $overlayFlag = 'true' ] && overlayFlag='false' || overlayFlag='true'
+
+			echo "overlayFlag=$overlayFlag"
+			press_enter_to_continue
+
+		elif [[ "$key" = 't' ]]; then
+
+			[ $tmpfsFlag = 'true' ] && tmpfsFlag='false' || tmpfsFlag='true'
+
+			echo "tmpfsFlag=$tmpfsFlag"
+			press_enter_to_continue
+
+		elif [[ "$key" = 'm' ]]; then
+
+			echo "FEATURE NOT CURRENTLY WORKING! (likely due to /etc/fstab overriding?)"
+
+			echo -e "\nType mount opts to add (will override current: $mountOpts):\n"
+
+			read mountOpts
+
+			echo -e "\nMounting options '$mountOpts' were added.\n"
+			press_enter_to_continue
+
+		elif [[ "$key" = 'c' ]]; then
+
+			echo -e "\nType the path you'd like to boot from.\n"
+
+			read bootPath
+
+			boot "$bootPath"
+
+		elif [[ "$key" = 'b' ]]; then
+
+			boot /
+
+		elif [[ "$key" = 'd' ]]; then
+
+			echo -e "\nWARNING: This will DELETE the entire root system (/)!"
+			echo "All directories EXCEPT /.squashfs will be removed."
+			echo -e "\nThis is a DESTRUCTIVE operation and CANNOT be undone!\n"
+
+			read -p "Type 'DELETE' in uppercase to confirm: " confirm
+
+			if [[ "$confirm" = "DELETE" ]]; then
+
+				echo -e "\nDeleting root system... Please wait...\n"
+
+				# Delete everything except .squashfs directory
+				find /mnt -mindepth 1 -maxdepth 1 ! -name '.squashfs' -exec rm -rf {} + 2>/dev/null
+
+				echo "Done! Root system deleted (except /.squashfs)"
+				press_enter_to_continue
+
+			else
+				echo "Cancelled. Root system NOT deleted."
+				press_enter_to_continue
+			fi
+
+		elif [[ "$key" = 'e' ]]; then
+
+			echo "Entering bash..."
+			bash
+
+		elif [[ "$key" = '' ]]; then # ie., <ENTER> was pressed
+
+			echo boot /
+			boot /
+
+		elif [[ "$key" = 'q' ]]; then
+
+			echo "Exiting."
+			finished=true
+
+			sleep 1
+
+		else
+
+			error "Not an known option ($key). Please try again."
+
+		fi
+
+	done
+
+	sleep 1
+
+}
