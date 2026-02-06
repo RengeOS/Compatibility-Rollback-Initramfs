@@ -2,7 +2,7 @@
 
 # --*--Do Not Modify The Variables Below Unless You Know What You Are Doing!--*--
 
-mountOpts='noatime,fix_errors'
+mountOpts='noatime'
 new_root=/new_root
 user=user
 mnt=/mnt
